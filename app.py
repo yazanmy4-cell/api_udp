@@ -67,10 +67,12 @@ PRIORITY_REGIONS = ["BD", "IND", "SG", "TH", "PH", "VN", "MY", "ID", "HK", "TW"]
 LW_START_INTERVAL = 3.0
 LW_NEW_MATCH_DELAY = 3.0
 LW_MAX_MATCH_DURATION = 700
-LW_MATCH_IDLE_TIMEOUT = 10.0
+LW_MATCH_IDLE_TIMEOUT = 15.0
 LW_RECONNECT_DELAY = 1.0
 LW_MAX_PARSE_FAILS = 5.0
 LW_TOKEN_TTL = 1200
+
+MIN_UID_LENGTH = 8
 
 
 def _pb_varint(n):
@@ -104,6 +106,22 @@ def _pb_field(f, v):
         d = bytes(v)
         return _pb_tag(f, 2) + _pb_varint(len(d)) + d
     return b""
+
+
+def is_valid_account_id(acc_id) -> bool:
+    try:
+        s = str(acc_id).strip()
+        if not s or s == "0":
+            return False
+        if not s.isdigit():
+            return False
+        if len(s) < MIN_UID_LENGTH:
+            return False
+        if int(s) == 0:
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def _generate_new_device() -> dict:
@@ -2337,6 +2355,37 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
 
         acc_id = str(majorlogin_response.account_id)
 
+        if not is_valid_account_id(acc_id):
+            log(f"[-] Invalid account_id '{acc_id}' for UID {uid} -> retry login")
+            for retry in range(5):
+                await asyncio.sleep(2)
+                try:
+                    tokengrant_response = await get_access_token(uid, password)
+                    if tokengrant_response is None:
+                        continue
+                    open_id, access_token, platform = tokengrant_response
+                    device_info = get_device_for_account(uid)
+                    login_payload_data = await build_majorlogin_payload(
+                        open_id, access_token, platform, client_version, device_info
+                    )
+                    if login_payload_data is None:
+                        continue
+                    majorlogin_response = await send_majorlogin(
+                        login_payload_data, release_version, server_url
+                    )
+                    if majorlogin_response is None:
+                        continue
+                    new_acc_id = str(majorlogin_response.account_id)
+                    if is_valid_account_id(new_acc_id):
+                        acc_id = new_acc_id
+                        log(f"[+] Retry OK | UID {acc_id}")
+                        break
+                except Exception as e:
+                    log(f"[-] Retry {retry+1} error: {e}")
+            else:
+                log(f"[-] Login failed after 5 retries for UID {uid}")
+                return None
+
         level = 0
         exp = 0
         likes = 0
@@ -2477,6 +2526,32 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
 
         acc_id = str(majorlogin_response.account_id)
 
+        if not is_valid_account_id(acc_id):
+            log(f"[-] Invalid account_id '{acc_id}' from token -> retry")
+            for retry in range(5):
+                await asyncio.sleep(2)
+                try:
+                    login_payload_data = await build_majorlogin_payload(
+                        open_id, access_token, str(platform), client_version, device_info
+                    )
+                    if login_payload_data is None:
+                        continue
+                    majorlogin_response = await send_majorlogin(
+                        login_payload_data, release_version, server_url
+                    )
+                    if majorlogin_response is None:
+                        continue
+                    new_acc_id = str(majorlogin_response.account_id)
+                    if is_valid_account_id(new_acc_id):
+                        acc_id = new_acc_id
+                        log(f"[+] Retry OK | UID {acc_id}")
+                        break
+                except Exception as e:
+                    log(f"[-] Retry {retry+1} error: {e}")
+            else:
+                log(f"[-] Token login failed after 5 retries")
+                return None
+
         level = 0
         exp = 0
         likes = 0
@@ -2546,7 +2621,13 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
 
 
 async def run_account_worker(account_data: Dict, label: str):
-    acc_id = str(account_data['account_id'])
+    acc_id = str(account_data['account_id']).strip()
+
+    if not is_valid_account_id(acc_id):
+        log(f"[!] Invalid account_id '{acc_id}' for {label} -> refusing to start")
+        bot_state.update_status(acc_id, "ERROR")
+        return
+
     informational_task = None
     exp_task = None
     functional_task = None
@@ -2648,9 +2729,12 @@ async def cb_login_only(payload: Dict):
         if not account_data:
             raise RuntimeError("Login failed")
 
-        uid = str(account_data["account_id"])
+        uid = str(account_data["account_id"]).strip()
 
-        bot_state.register_account(
+        if not is_valid_account_id(uid):
+            raise RuntimeError(f"Invalid account_id returned: {uid}")
+
+        ok = bot_state.register_account(
             uid,
             account_data.get("nickname", f"Player_{uid}"),
             account_data.get("region", "ME"),
@@ -2658,6 +2742,9 @@ async def cb_login_only(payload: Dict):
             account_data.get("exp", 0),
             account_data.get("likes", 0),
         )
+        if not ok:
+            raise RuntimeError(f"register_account rejected uid: {uid}")
+
         bot_state.account_credentials[uid] = account_data
         bot_state.accounts[uid]["status"] = "READY"
         log(f"[API] Registered UID {uid} - ready")
@@ -2665,6 +2752,67 @@ async def cb_login_only(payload: Dict):
     except Exception as e:
         log(f"[API] login_only error: {e}")
         raise
+
+
+async def cb_relogin(old_uid: str, auth_uid: str, auth_password: str):
+    try:
+        log(f"[RELOGIN] Invalid uid '{old_uid}' -> re-login for auth_uid={auth_uid}")
+
+        try:
+            bot_state.accounts.pop(old_uid, None)
+            bot_state.account_credentials.pop(old_uid, None)
+            bot_state.exp_targets_ref.pop(old_uid, None)
+            bot_state.start_exp_ref.pop(old_uid, None)
+            bot_state.session_matches_ref.pop(old_uid, None)
+            bot_state.account_start_ref.pop(old_uid, None)
+            bot_state.exp_limit_reached_ref.discard(old_uid)
+            t = bot_state.account_workers.pop(old_uid, None)
+            if t and not t.done():
+                t.cancel()
+        except Exception:
+            pass
+
+        new_data = None
+        for attempt in range(5):
+            try:
+                new_data = await process_account_uid_pass(auth_uid, auth_password)
+                if new_data:
+                    new_uid = str(new_data.get("account_id", "")).strip()
+                    if is_valid_account_id(new_uid):
+                        log(f"[RELOGIN] OK -> new uid = {new_uid}")
+                        break
+                    log(f"[RELOGIN] attempt {attempt+1}: invalid uid '{new_uid}' -> retry")
+                    new_data = None
+            except Exception as e:
+                log(f"[RELOGIN] attempt {attempt+1} error: {e}")
+            await asyncio.sleep(3)
+
+        if not new_data:
+            log(f"[RELOGIN] FAILED after 5 attempts for {auth_uid}")
+            return None
+
+        new_uid = str(new_data.get("account_id", "")).strip()
+
+        ok = bot_state.register_account(
+            new_uid,
+            new_data.get("nickname", f"Player_{new_uid}"),
+            new_data.get("region", "ME"),
+            new_data.get("level", 1),
+            new_data.get("exp", 0),
+            new_data.get("likes", 0),
+        )
+        if not ok:
+            log(f"[RELOGIN] register_account rejected {new_uid}")
+            return None
+
+        bot_state.account_credentials[new_uid] = new_data
+        bot_state.accounts[new_uid]["status"] = "READY"
+        log(f"[RELOGIN] Registered {new_uid} - ready")
+        return new_uid
+
+    except Exception as e:
+        log(f"[RELOGIN] error: {e}")
+        return None
 
 
 async def cb_set_target(uid: str, target: int):
@@ -2682,6 +2830,8 @@ async def cb_set_target(uid: str, target: int):
 async def cb_start_account(uid: str):
     try:
         uid = str(uid)
+        if not is_valid_account_id(uid):
+            raise RuntimeError(f"Invalid uid: {uid}")
         creds = bot_state.account_credentials.get(uid)
         if not creds:
             raise RuntimeError(f"No credentials for {uid}")
@@ -2837,6 +2987,8 @@ async def cb_gen_start(uid: str):
         if not credentials:
             raise RuntimeError("Login failed")
         uid_real = str(credentials["account_id"])
+        if not is_valid_account_id(uid_real):
+            raise RuntimeError(f"Invalid account_id: {uid_real}")
         bot_state.register_account(
             uid_real,
             credentials.get("nickname", f"Player_{uid_real}"),
@@ -2883,6 +3035,8 @@ async def cb_gen_import(uid: str):
         if not credentials:
             raise RuntimeError("Login failed")
         uid_real = str(credentials["account_id"])
+        if not is_valid_account_id(uid_real):
+            raise RuntimeError(f"Invalid account_id: {uid_real}")
         bot_state.register_account(
             uid_real,
             credentials.get("nickname", f"Player_{uid_real}"),
@@ -2910,6 +3064,7 @@ async def main():
     bot_state.bind_loop()
 
     bot_state.refresh_callbacks["on_account_login_only"] = cb_login_only
+    bot_state.refresh_callbacks["on_relogin"] = cb_relogin
     bot_state.refresh_callbacks["on_set_target"] = cb_set_target
     bot_state.refresh_callbacks["on_start_account"] = cb_start_account
     bot_state.refresh_callbacks["on_stop_account"] = cb_stop_account
@@ -2937,7 +3092,24 @@ async def main():
 
 
 if __name__ == "__main__":
+    import traceback
     try:
+        if sys.platform == "win32":
+            try:
+                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            except Exception:
+                pass
+        print(">>> Starting YAZAN LEVEL...")
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nStopped.")
+        print("\n>>> Stopped by user.")
+    except Exception:
+        print("\n" + "=" * 60)
+        print("[FATAL ERROR]")
+        print("=" * 60)
+        traceback.print_exc()
+    finally:
+        try:
+            input("\n>>> Press Enter to exit...")
+        except Exception:
+            pass
