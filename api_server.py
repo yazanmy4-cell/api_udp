@@ -2,7 +2,7 @@ import asyncio
 import os
 import time
 import json
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Optional, Callable, List, Tuple
 from aiohttp import web
 
 ADMIN_TOKEN = os.getenv("API_TOKEN", "yazan_secret_2024")
@@ -10,6 +10,22 @@ BR_PHASE_SECONDS = 15 * 60
 COOLDOWN_SECONDS = 3 * 60
 MAX_MATCHES_PER_ACCOUNT = 200
 MAX_EXP_TARGET = 50000
+
+
+def is_valid_uid(uid) -> bool:
+    try:
+        s = str(uid).strip()
+        if not s:
+            return False
+        if s == "0":
+            return False
+        if not s.isdigit():
+            return False
+        if int(s) == 0:
+            return False
+        return True
+    except Exception:
+        return False
 
 
 class BotState:
@@ -34,7 +50,9 @@ class BotState:
         self._loop = asyncio.get_running_loop()
 
     def register_account(self, uid, nickname, region, level, exp, likes=0):
-        uid = str(uid)
+        uid = str(uid).strip()
+        if not is_valid_uid(uid):
+            return False
         existing = self.accounts.get(uid, {})
         self.accounts[uid] = {
             "uid": uid,
@@ -48,28 +66,29 @@ class BotState:
             "matches_played": existing.get("matches_played", 0),
             "phase": existing.get("phase", "IDLE"),
         }
+        return True
 
     def update_status(self, uid, status, active_matches=None):
-        uid = str(uid)
+        uid = str(uid).strip()
         if uid in self.accounts:
             self.accounts[uid]["status"] = status
             if active_matches is not None:
                 self.accounts[uid]["active_matches"] = int(active_matches)
 
     def update_exp(self, uid, exp, level=None):
-        uid = str(uid)
+        uid = str(uid).strip()
         if uid in self.accounts:
             self.accounts[uid]["exp"] = int(exp)
             if level is not None:
                 self.accounts[uid]["level"] = int(level)
 
     def update_exp_target(self, uid, target):
-        uid = str(uid)
+        uid = str(uid).strip()
         if uid in self.accounts:
             self.accounts[uid]["target"] = int(target)
 
     def increment_match(self, uid):
-        uid = str(uid)
+        uid = str(uid).strip()
         if uid in self.accounts:
             self.accounts[uid]["active_matches"] = self.accounts[uid].get("active_matches", 0) + 1
             self.accounts[uid]["matches_played"] = self.accounts[uid].get("matches_played", 0) + 1
@@ -173,36 +192,22 @@ async def api_start(request: web.Request):
         return web.json_response({"ok": False, "error": "Backend not ready"}, status=500)
 
     try:
-        await login_handler(payload)
+        real_uid = await login_handler(payload)
     except Exception as e:
         return web.json_response({"ok": False, "error": f"Login failed: {e}"}, status=500)
 
-    uid = None
-    deadline = time.time() + 90
-    while time.time() < deadline:
-        for k, creds in list(bot_state.account_credentials.items()):
-            if token and creds.get("auth_type") == "token" and creds.get("auth_token") == token:
-                uid = str(creds.get("account_id"))
-                break
-            if uid_in and creds.get("auth_type") == "guest" and str(creds.get("auth_uid")) == uid_in:
-                uid = str(creds.get("account_id"))
-                break
-        if uid and uid in bot_state.accounts:
-            break
-        await asyncio.sleep(0.5)
-
-    if not uid:
-        return web.json_response({"ok": False, "error": "Login timeout"}, status=502)
+    if not real_uid or not is_valid_uid(real_uid):
+        return web.json_response({"ok": False, "error": "Invalid account_id returned"}, status=502)
 
     setter = bot_state.refresh_callbacks.get("on_set_target")
     if setter:
-        await setter(uid, target)
+        await setter(real_uid, target)
 
     starter = bot_state.refresh_callbacks.get("on_start_account")
     if starter:
-        await starter(uid)
+        await starter(real_uid)
 
-    return web.json_response({"ok": True, "uid": uid, "target": target})
+    return web.json_response({"ok": True, "uid": real_uid, "target": target})
 
 
 @_auth_required
@@ -248,6 +253,66 @@ async def api_delete(request: web.Request):
 
 
 @_auth_required
+async def api_delete_all(request: web.Request):
+    deleted = []
+    failed = []
+    uids = list(bot_state.accounts.keys())
+
+    for uid in uids:
+        t = bot_state.auto_cycle_tasks.pop(uid, None)
+        if t and not t.done():
+            t.cancel()
+
+        handler = bot_state.refresh_callbacks.get("on_delete_account")
+        if handler:
+            try:
+                await handler(uid)
+                deleted.append(uid)
+            except Exception:
+                failed.append(uid)
+                try:
+                    bot_state.accounts.pop(uid, None)
+                    bot_state.account_credentials.pop(uid, None)
+                    bot_state.exp_targets_ref.pop(uid, None)
+                    bot_state.start_exp_ref.pop(uid, None)
+                    bot_state.session_matches_ref.pop(uid, None)
+                    bot_state.account_start_ref.pop(uid, None)
+                    bot_state.exp_limit_reached_ref.discard(uid)
+                except Exception:
+                    pass
+        else:
+            failed.append(uid)
+
+    return web.json_response({
+        "ok": True,
+        "deleted": deleted,
+        "failed": failed,
+        "deleted_count": len(deleted),
+        "failed_count": len(failed),
+        "remaining": len(bot_state.accounts)
+    })
+
+
+@_auth_required
+async def api_cleanup(request: web.Request):
+    removed = []
+    for uid in list(bot_state.accounts.keys()):
+        if not is_valid_uid(uid):
+            bot_state.accounts.pop(uid, None)
+            bot_state.account_credentials.pop(uid, None)
+            bot_state.exp_targets_ref.pop(uid, None)
+            bot_state.start_exp_ref.pop(uid, None)
+            bot_state.session_matches_ref.pop(uid, None)
+            bot_state.account_start_ref.pop(uid, None)
+            bot_state.exp_limit_reached_ref.discard(uid)
+            t = bot_state.account_workers.pop(uid, None)
+            if t and not t.done():
+                t.cancel()
+            removed.append(uid)
+    return web.json_response({"ok": True, "removed": removed, "count": len(removed)})
+
+
+@_auth_required
 async def api_lvl_cycle(request: web.Request):
     accounts_list = []
     target = MAX_EXP_TARGET
@@ -261,7 +326,8 @@ async def api_lvl_cycle(request: web.Request):
                     continue
                 if ":" in pair:
                     u, p = pair.split(":", 1)
-                    accounts_list.append((u.strip(), p.strip()))
+                    if u.strip() and p.strip():
+                        accounts_list.append((u.strip(), p.strip()))
         try:
             target = int(request.query.get("target", MAX_EXP_TARGET))
         except Exception:
@@ -306,46 +372,75 @@ async def api_lvl_cycle(request: web.Request):
 
 async def _auto_cycle_one(auth_uid: str, auth_pass: str, target: int):
     login_handler = bot_state.refresh_callbacks.get("on_account_login_only")
+    relogin_handler = bot_state.refresh_callbacks.get("on_relogin")
     starter = bot_state.refresh_callbacks.get("on_start_account")
     stopper = bot_state.refresh_callbacks.get("on_stop_account")
     setter = bot_state.refresh_callbacks.get("on_set_target")
     refresher = bot_state.refresh_callbacks.get("on_refresh_profile")
 
     round_num = 0
+    real_uid = None
+
     while True:
         round_num += 1
 
-        try:
-            await login_handler({"type": "guest", "uid": auth_uid, "password": auth_pass})
-        except Exception as e:
-            bot_state.log(f"[CYCLE] login fail {auth_uid}: {e}")
-            await asyncio.sleep(30)
-            continue
-
-        real_uid = None
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            for k, creds in list(bot_state.account_credentials.items()):
-                if creds.get("auth_type") == "guest" and str(creds.get("auth_uid")) == auth_uid:
-                    real_uid = str(creds.get("account_id"))
-                    break
-            if real_uid:
+        # ===== 1) LOGIN =====
+        creds_found = None
+        for k, creds in list(bot_state.account_credentials.items()):
+            if creds.get("auth_type") == "guest" and str(creds.get("auth_uid")) == auth_uid:
+                creds_found = creds
                 break
-            await asyncio.sleep(0.5)
 
-        if not real_uid:
-            bot_state.log(f"[CYCLE] no real_uid for {auth_uid}, retry")
-            await asyncio.sleep(20)
+        # إذا creds موجودة لكن uid غير صالح → relogin
+        if creds_found and not is_valid_uid(creds_found.get("account_id")):
+            old_uid = str(creds_found.get("account_id", "?"))
+            bot_state.log(f"[CYCLE] uid '{old_uid}' invalid -> forcing re-login for {auth_uid}")
+            if relogin_handler:
+                try:
+                    new_uid = await relogin_handler(old_uid, auth_uid, auth_pass)
+                    if new_uid and is_valid_uid(new_uid):
+                        real_uid = str(new_uid)
+                        bot_state.log(f"[CYCLE] re-login OK -> {real_uid}")
+                    else:
+                        bot_state.log(f"[CYCLE] re-login failed for {auth_uid}")
+                        await asyncio.sleep(20)
+                        continue
+                except Exception as e:
+                    bot_state.log(f"[CYCLE] relogin error: {e}")
+                    await asyncio.sleep(20)
+                    continue
+
+        # إذا مافي creds → login عادي
+        elif not creds_found:
+            try:
+                result = await login_handler({"type": "guest", "uid": auth_uid, "password": auth_pass})
+                if not result or not is_valid_uid(result):
+                    bot_state.log(f"[CYCLE] login invalid uid for {auth_uid}: {result}")
+                    await asyncio.sleep(15)
+                    continue
+                real_uid = str(result)
+                bot_state.log(f"[CYCLE] login OK -> real_uid={real_uid}")
+            except Exception as e:
+                bot_state.log(f"[CYCLE] login fail {auth_uid}: {e}")
+                await asyncio.sleep(15)
+                continue
+        else:
+            real_uid = str(creds_found.get("account_id"))
+
+        if not is_valid_uid(real_uid):
+            bot_state.log(f"[CYCLE] real_uid '{real_uid}' invalid -> retry")
+            await asyncio.sleep(10)
             continue
 
-        bot_state.auto_cycle_phase[real_uid] = "BR"
-
+        # ===== 2) SET TARGET =====
         if setter:
             try:
                 await setter(real_uid, target)
             except Exception:
                 pass
 
+        # ===== 3) START BR =====
+        bot_state.auto_cycle_phase[real_uid] = "BR"
         if starter:
             try:
                 await starter(real_uid)
@@ -357,16 +452,19 @@ async def _auto_cycle_one(auth_uid: str, auth_pass: str, target: int):
         bot_state.log(f"[CYCLE] {real_uid} round {round_num} - BR phase")
         await asyncio.sleep(BR_PHASE_SECONDS)
 
+        # ===== 4) STOP =====
         if stopper:
             try:
                 await stopper(real_uid)
             except Exception:
                 pass
 
+        # ===== 5) COOLDOWN =====
         bot_state.auto_cycle_phase[real_uid] = "COOLDOWN"
         bot_state.log(f"[CYCLE] {real_uid} cooldown")
         await asyncio.sleep(COOLDOWN_SECONDS)
 
+        # ===== 6) REFRESH =====
         try:
             creds = bot_state.account_credentials.get(real_uid)
             if creds and refresher:
@@ -374,38 +472,21 @@ async def _auto_cycle_one(auth_uid: str, auth_pass: str, target: int):
         except Exception:
             pass
 
+        # ===== 7) RE-LOGIN =====
         try:
-            await login_handler({"type": "guest", "uid": auth_uid, "password": auth_pass})
+            result = await login_handler({"type": "guest", "uid": auth_uid, "password": auth_pass})
+            if not result or not is_valid_uid(result):
+                bot_state.log(f"[CYCLE] re-login invalid for {auth_uid}: {result}")
+                await asyncio.sleep(15)
+                continue
+            real_uid = str(result)
+            bot_state.log(f"[CYCLE] re-login OK -> {real_uid}")
         except Exception as e:
-            bot_state.log(f"[CYCLE] re-login fail {real_uid}: {e}")
-            await asyncio.sleep(30)
+            bot_state.log(f"[CYCLE] re-login fail: {e}")
+            await asyncio.sleep(15)
             continue
 
-        new_uid = None
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            for k, creds in list(bot_state.account_credentials.items()):
-                if creds.get("auth_type") == "guest" and str(creds.get("auth_uid")) == auth_uid:
-                    new_uid = str(creds.get("account_id"))
-                    break
-            if new_uid:
-                break
-            await asyncio.sleep(0.5)
-
-        if not new_uid:
-            bot_state.log(f"[CYCLE] re-login timeout {auth_uid}")
-            await asyncio.sleep(20)
-            continue
-
-        real_uid = new_uid
-        bot_state.auto_cycle_phase[real_uid] = "LW"
-
-        if setter:
-            try:
-                await setter(real_uid, target)
-            except Exception:
-                pass
-
+        # ===== 8) FORCE LW =====
         try:
             creds = bot_state.account_credentials.get(real_uid)
             if creds:
@@ -417,6 +498,13 @@ async def _auto_cycle_one(auth_uid: str, auth_pass: str, target: int):
         except Exception:
             pass
 
+        if setter:
+            try:
+                await setter(real_uid, target)
+            except Exception:
+                pass
+
+        bot_state.auto_cycle_phase[real_uid] = "LW"
         if starter:
             try:
                 await starter(real_uid)
@@ -425,6 +513,7 @@ async def _auto_cycle_one(auth_uid: str, auth_pass: str, target: int):
 
         bot_state.log(f"[CYCLE] {real_uid} round {round_num} - LW phase")
 
+        # ===== 9) WAIT UNTIL 200 MATCHES =====
         while True:
             await asyncio.sleep(30)
             acc = bot_state.accounts.get(real_uid)
@@ -439,6 +528,7 @@ async def _auto_cycle_one(auth_uid: str, auth_pass: str, target: int):
                 bot_state.log(f"[CYCLE] {real_uid} worker stopped")
                 break
 
+        # ===== 10) STOP + RESTART =====
         if stopper:
             try:
                 await stopper(real_uid)
@@ -474,6 +564,8 @@ async def root(request: web.Request):
             "POST /start": "{uid,password,target} or {token,target}",
             "POST /stop": "{uid}",
             "POST /delete": "{uid}",
+            "POST /delete-all": "delete ALL accounts from this server",
+            "POST /cleanup": "remove invalid uids (like 0)",
             "POST /lvl": "{accounts:[{uid,password}],target}",
             "GET /lvl": "?accounts=uid1:pass1,uid2:pass2&target=50000",
             "GET /logs": "last 200 logs",
@@ -490,6 +582,8 @@ async def start_api_server(host="0.0.0.0", port=8080):
     app.router.add_post("/start", api_start)
     app.router.add_post("/stop", api_stop)
     app.router.add_post("/delete", api_delete)
+    app.router.add_post("/delete-all", api_delete_all)
+    app.router.add_post("/cleanup", api_cleanup)
     app.router.add_post("/lvl", api_lvl_cycle)
     app.router.add_get("/lvl", api_lvl_cycle)
     app.router.add_get("/logs", api_logs)
