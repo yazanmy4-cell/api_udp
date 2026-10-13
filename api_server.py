@@ -17,12 +17,6 @@ def is_valid_uid(uid) -> bool:
         s = str(uid).strip()
         if not s:
             return False
-        if s == "0":
-            return False
-        if not s.isdigit():
-            return False
-        if int(s) == 0:
-            return False
         return True
     except Exception:
         return False
@@ -51,7 +45,7 @@ class BotState:
 
     def register_account(self, uid, nickname, region, level, exp, likes=0):
         uid = str(uid).strip()
-        if not is_valid_uid(uid):
+        if not uid:
             return False
         existing = self.accounts.get(uid, {})
         self.accounts[uid] = {
@@ -196,8 +190,8 @@ async def api_start(request: web.Request):
     except Exception as e:
         return web.json_response({"ok": False, "error": f"Login failed: {e}"}, status=500)
 
-    if not real_uid or not is_valid_uid(real_uid):
-        return web.json_response({"ok": False, "error": "Invalid account_id returned"}, status=502)
+    if not real_uid:
+        return web.json_response({"ok": False, "error": "Login returned no uid"}, status=502)
 
     setter = bot_state.refresh_callbacks.get("on_set_target")
     if setter:
@@ -372,7 +366,6 @@ async def api_lvl_cycle(request: web.Request):
 
 async def _auto_cycle_one(auth_uid: str, auth_pass: str, target: int):
     login_handler = bot_state.refresh_callbacks.get("on_account_login_only")
-    relogin_handler = bot_state.refresh_callbacks.get("on_relogin")
     starter = bot_state.refresh_callbacks.get("on_start_account")
     stopper = bot_state.refresh_callbacks.get("on_stop_account")
     setter = bot_state.refresh_callbacks.get("on_set_target")
@@ -384,52 +377,22 @@ async def _auto_cycle_one(auth_uid: str, auth_pass: str, target: int):
     while True:
         round_num += 1
 
-        # ===== 1) LOGIN =====
-        creds_found = None
-        for k, creds in list(bot_state.account_credentials.items()):
-            if creds.get("auth_type") == "guest" and str(creds.get("auth_uid")) == auth_uid:
-                creds_found = creds
-                break
-
-        # إذا creds موجودة لكن uid غير صالح → relogin
-        if creds_found and not is_valid_uid(creds_found.get("account_id")):
-            old_uid = str(creds_found.get("account_id", "?"))
-            bot_state.log(f"[CYCLE] uid '{old_uid}' invalid -> forcing re-login for {auth_uid}")
-            if relogin_handler:
-                try:
-                    new_uid = await relogin_handler(old_uid, auth_uid, auth_pass)
-                    if new_uid and is_valid_uid(new_uid):
-                        real_uid = str(new_uid)
-                        bot_state.log(f"[CYCLE] re-login OK -> {real_uid}")
-                    else:
-                        bot_state.log(f"[CYCLE] re-login failed for {auth_uid}")
-                        await asyncio.sleep(20)
-                        continue
-                except Exception as e:
-                    bot_state.log(f"[CYCLE] relogin error: {e}")
-                    await asyncio.sleep(20)
-                    continue
-
-        # إذا مافي creds → login عادي
-        elif not creds_found:
-            try:
-                result = await login_handler({"type": "guest", "uid": auth_uid, "password": auth_pass})
-                if not result or not is_valid_uid(result):
-                    bot_state.log(f"[CYCLE] login invalid uid for {auth_uid}: {result}")
-                    await asyncio.sleep(15)
-                    continue
-                real_uid = str(result)
-                bot_state.log(f"[CYCLE] login OK -> real_uid={real_uid}")
-            except Exception as e:
-                bot_state.log(f"[CYCLE] login fail {auth_uid}: {e}")
+        # ===== 1) LOGIN مباشر بدون أي فحص =====
+        try:
+            result = await login_handler({"type": "guest", "uid": auth_uid, "password": auth_pass})
+            if not result:
+                bot_state.log(f"[CYCLE] login returned empty for {auth_uid}")
                 await asyncio.sleep(15)
                 continue
-        else:
-            real_uid = str(creds_found.get("account_id"))
-
-        if not is_valid_uid(real_uid):
-            bot_state.log(f"[CYCLE] real_uid '{real_uid}' invalid -> retry")
-            await asyncio.sleep(10)
+            real_uid = str(result).strip()
+            if not real_uid:
+                bot_state.log(f"[CYCLE] login returned empty uid for {auth_uid}")
+                await asyncio.sleep(15)
+                continue
+            bot_state.log(f"[CYCLE] login OK -> real_uid={real_uid}")
+        except Exception as e:
+            bot_state.log(f"[CYCLE] login fail {auth_uid}: {e}")
+            await asyncio.sleep(15)
             continue
 
         # ===== 2) SET TARGET =====
@@ -472,14 +435,18 @@ async def _auto_cycle_one(auth_uid: str, auth_pass: str, target: int):
         except Exception:
             pass
 
-        # ===== 7) RE-LOGIN =====
+        # ===== 7) RE-LOGIN مباشر =====
         try:
             result = await login_handler({"type": "guest", "uid": auth_uid, "password": auth_pass})
-            if not result or not is_valid_uid(result):
-                bot_state.log(f"[CYCLE] re-login invalid for {auth_uid}: {result}")
+            if not result:
+                bot_state.log(f"[CYCLE] re-login empty for {auth_uid}")
                 await asyncio.sleep(15)
                 continue
-            real_uid = str(result)
+            real_uid = str(result).strip()
+            if not real_uid:
+                bot_state.log(f"[CYCLE] re-login empty uid")
+                await asyncio.sleep(15)
+                continue
             bot_state.log(f"[CYCLE] re-login OK -> {real_uid}")
         except Exception as e:
             bot_state.log(f"[CYCLE] re-login fail: {e}")
@@ -565,7 +532,7 @@ async def root(request: web.Request):
             "POST /stop": "{uid}",
             "POST /delete": "{uid}",
             "POST /delete-all": "delete ALL accounts from this server",
-            "POST /cleanup": "remove invalid uids (like 0)",
+            "POST /cleanup": "remove empty uids only",
             "POST /lvl": "{accounts:[{uid,password}],target}",
             "GET /lvl": "?accounts=uid1:pass1,uid2:pass2&target=50000",
             "GET /logs": "last 200 logs",
