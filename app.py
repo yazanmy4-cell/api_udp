@@ -74,6 +74,46 @@ LW_TOKEN_TTL = 1200
 
 MIN_UID_LENGTH = 8
 
+SAFE_PLAY_MODE = True
+BYPASS_TIMING_JITTER = True
+BYPASS_PACKET_JITTER = True
+BYPASS_HELLO_DELAY = True
+BYPASS_KA_JITTER = True
+
+ENABLE_ANTI_AFK = True
+ANTI_AFK_MIN_INTERVAL = 1.8
+ANTI_AFK_MAX_INTERVAL = 3.5
+
+
+def bypass_jitter(base, spread=0.35):
+    if not (SAFE_PLAY_MODE and BYPASS_TIMING_JITTER):
+        return base
+    return max(0.05, base + random.uniform(-spread, spread))
+
+
+def bypass_packet_jitter(base, spread_ratio=0.35):
+    if not (SAFE_PLAY_MODE and BYPASS_PACKET_JITTER):
+        return base
+    return max(0.1, base + random.uniform(-base * spread_ratio, base * spread_ratio))
+
+
+def bypass_hello_delay():
+    if not (SAFE_PLAY_MODE and BYPASS_HELLO_DELAY):
+        return 0.0
+    return random.uniform(0.05, 0.45)
+
+
+def bypass_ka_jitter(base=5.0):
+    if not (SAFE_PLAY_MODE and BYPASS_KA_JITTER):
+        return base
+    return max(3.0, base + random.uniform(-0.8, 1.2))
+
+
+def bypass_human_reconnect_delay(attempt):
+    if not (SAFE_PLAY_MODE and BYPASS_TIMING_JITTER):
+        return min(attempt * 0.5, 2.0)
+    return max(0.05, min(attempt * 0.5, 2.0) + random.uniform(-0.4, 0.7))
+
 
 def _pb_varint(n):
     if n < 0:
@@ -1106,7 +1146,7 @@ async def keepalive_ping(sock, ip, port, key_bytes, mask, stop_event):
             pass
         i += 1
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=3.0)
+            await asyncio.wait_for(stop_event.wait(), timeout=bypass_packet_jitter(3.0, 0.4))
         except asyncio.TimeoutError:
             pass
 
@@ -1197,6 +1237,61 @@ async def read_varints_full(b):
     return out
 
 
+def unzigzag(n):
+    return (n >> 1) ^ -(n & 1)
+
+
+async def send_anti_afk_fire(sock, addr, udp_key_bytes, match_code, account_id):
+    try:
+        _, nr = await layouts_from_mask(match_code)
+        try:
+            pid = int(account_id)
+        except Exception:
+            pid = 0
+        ts = int(time.time() * 1000) & 0xFFFFFFFF
+
+        fire = struct.pack("<IIB", pid & 0xFFFFFFFF, ts, 1)
+        fp = await build_packet(0x68, nr, 0, 104, None, 0, fire, udp_key_bytes, encrypted=False)
+        loop = asyncio.get_event_loop()
+        await loop.sock_sendto(sock, fp, addr)
+        await asyncio.sleep(bypass_jitter(random.uniform(0.15, 0.30), 0.05))
+        stop = struct.pack("<IIB", pid & 0xFFFFFFFF, ts + 200, 0)
+        sp = await build_packet(0x68, nr, 0, 105, None, 0, stop, udp_key_bytes, encrypted=False)
+        await loop.sock_sendto(sock, sp, addr)
+        return True
+    except Exception:
+        return False
+
+
+async def anti_afk_worker(sock, ip, port, udp_key_bytes, match_code, account_id, stop_event, match_index):
+    if not ENABLE_ANTI_AFK:
+        return
+    addr = (ip, port)
+    fires = 0
+    try:
+        await asyncio.sleep(bypass_jitter(2.5, 0.5))
+        while not stop_event.is_set():
+            try:
+                if await send_anti_afk_fire(sock, addr, udp_key_bytes, match_code, account_id):
+                    fires += 1
+                w = random.uniform(ANTI_AFK_MIN_INTERVAL, ANTI_AFK_MAX_INTERVAL)
+                w = bypass_packet_jitter(w, 0.25)
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=w)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(1.0)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if fires > 0:
+            log(f"[AFK] #{match_index} Fires={fires}")
+
+
 async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     account_id, player_region, client_version, key, iv,
                     match_index: int):
@@ -1204,6 +1299,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
     ping_task = None
     sock = None
     ping_stop = asyncio.Event()
+    anti_stop = asyncio.Event()
+    anti_task = None
     uid_str = str(account_id)
     completed_cleanly = False
 
@@ -1213,14 +1310,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
     land_x = 0
     land_z = 0
     glide_distance = 500000
-    player_state = 21073
-    player_x = 1400160
-    player_y = 295
-    player_z = 0
     player_tick = 860
     player_counter = 6773
-    msg_key_counter = 0
-    movement_keys = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109]
     idle_sent = False
     jump_sent = False
     parachute_opened = False
@@ -1246,8 +1337,14 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         sock.setblocking(False)
 
         udp_key_bytes = bytes.fromhex(udp_key)
+        await asyncio.sleep(bypass_hello_delay())
         hello_packet = await build_hello_packet(f"{account_id}_2585", udp_key_bytes, match_code)
         await loop.sock_sendto(sock, bytes.fromhex(hello_packet), (resolved_ip, port))
+
+        anti_task = asyncio.create_task(
+            anti_afk_worker(sock, resolved_ip, port, udp_key_bytes, match_code,
+                           account_id, anti_stop, match_index)
+        )
 
         ack_state = "waiting_for_hello_reply"
         thunder_sent = False
@@ -1263,23 +1360,6 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         last_activity = time.time()
         MAX_IDLE_BEFORE_HELLO_RESEND = 7.0
 
-        async def send_move_packet(move_state, x, y, z, phase="game", target_addr=None):
-            nonlocal msg_key_counter, player_counter, player_tick
-            msg_key = movement_keys[msg_key_counter % len(movement_keys)]
-            msg_key_counter += 1
-            move_id = player_id if player_id else account_id
-            pkt = build_movement_packet_2001(
-                udp_key_bytes, msg_key, player_state,
-                int(x), int(y), int(z),
-                player_tick, player_counter,
-                move_state, move_id, match_code, phase
-            )
-            dest = target_addr if target_addr else (resolved_ip, port)
-            await loop.sock_sendto(sock, pkt, dest)
-            player_counter += 130
-            player_tick += 41
-            return pkt
-
         async def send_thunder_sharma_inline():
             nonlocal ack_state, thunder_sent, sharma_sent
             if thunder_sent:
@@ -1290,101 +1370,19 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                 try:
                     await loop.sock_sendto(sock, bytes.fromhex(thunder), (resolved_ip, port))
                     thunder_sent = True
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(bypass_jitter(0.3, 0.05))
                     prepare_ack = await build_packet(
                         0x68, (await layouts_from_mask(match_code))[1],
                         0, 2, None, 1, b"\x01\x00", udp_key_bytes
                     )
                     await loop.sock_sendto(sock, prepare_ack, (resolved_ip, port))
-                    await asyncio.sleep(0.4)
+                    await asyncio.sleep(bypass_jitter(0.4, 0.05))
                     await loop.sock_sendto(sock, bytes.fromhex(sharma), (resolved_ip, port))
                     sharma_sent = True
                     ack_state = "thunder_sharma_sent"
                     log(f"[MATCH #{match_index}] Startup delivered. Playing.")
                 except Exception as e:
                     log(f"[MATCH #{match_index}] Startup send failed: {e}")
-
-        async def handle_movement(frame, server_addr):
-            nonlocal jump_calculated, jump_time_abs, land_x, land_z, jump_sent
-            nonlocal parachute_opened, parachute_time, landed, land_time, ground_move_counter
-            nonlocal idle_sent, player_id, join_info
-
-            _cmd = frame['cmd']
-
-            if _cmd == 101 and join_info is None:
-                try:
-                    vs = await read_varints_full(frame['content'])
-                    if len(vs) >= 3:
-                        uid_v = vs[0]
-                        pid_v = vs[2]
-                        if uid_v and pid_v:
-                            join_info = {'uid': uid_v, 'player_id': pid_v}
-                            player_id = pid_v
-                except Exception:
-                    pass
-
-            if _cmd == 2038 and not idle_sent:
-                await send_move_packet(200, player_x, player_y, player_z,
-                                       phase="arena", target_addr=server_addr)
-                idle_sent = True
-
-            if _cmd == 1001:
-                try:
-                    vs = await read_varints_full(frame['content'])
-                    if len(vs) >= 6 and vs[1] == 2 and 100000 < abs(vs[4]) < 3000000:
-                        now = time.time()
-                        plane.append({'t': now, 'x': vs[3], 'y': vs[4], 'z': vs[5]})
-                        if len(plane) >= 5 and not jump_calculated:
-                            from collections import Counter
-                            y_clusters = Counter(round(p['y'] / 1000) for p in plane)
-                            top_y, cnt = y_clusters.most_common(1)[0]
-                            if cnt >= 3:
-                                psel = [p for p in plane if round(p['y'] / 1000) == top_y]
-                                p0, p1 = psel[0], psel[-1]
-                                dt = p1['t'] - p0['t']
-                                dist = ((p1['x'] - p0['x']) ** 2 + (p1['z'] - p0['z']) ** 2) ** 0.5
-                                speed = dist / dt if dt > 0 else 0
-                                if speed > 0:
-                                    dx = p1['x'] - p0['x']
-                                    dz = p1['z'] - p0['z']
-                                    direction = math.atan2(dz, dx)
-                                    land_x = p1['x'] + glide_distance * math.cos(direction + math.pi / 2)
-                                    land_z = p1['z'] + glide_distance * math.sin(direction + math.pi / 2)
-                                    time_to_jump = glide_distance / speed
-                                    jump_time_abs = time.time() + time_to_jump
-                                    jump_calculated = True
-                except Exception:
-                    pass
-
-            if jump_calculated and jump_time_abs and time.time() >= jump_time_abs and not jump_sent:
-                await send_move_packet(116, land_x, 700000, land_z, target_addr=server_addr)
-                jump_sent = True
-                parachute_time = time.time()
-                jump_calculated = False
-                jump_time_abs = None
-                plane.clear()
-
-            if jump_sent and not parachute_opened and time.time() - parachute_time > 2:
-                await send_move_packet(82, land_x, 500000, land_z, target_addr=server_addr)
-                parachute_opened = True
-
-            if parachute_opened and not landed and time.time() - parachute_time > 8:
-                await send_move_packet(20, land_x, 0, land_z, target_addr=server_addr)
-                landed = True
-                land_time = time.time()
-                ground_move_counter = 0
-
-            if landed and time.time() - land_time > 0.3:
-                land_time = time.time()
-                ground_move_counter += 1
-                if ground_move_counter % 5 == 0:   move_state, z_off = 40, 0
-                elif ground_move_counter % 5 == 1: move_state, z_off = 104, 50
-                elif ground_move_counter % 5 == 2: move_state, z_off = 132, 100
-                elif ground_move_counter % 5 == 3: move_state, z_off = 136, 0
-                else:                              move_state, z_off = 26, 0
-                x_off = ground_move_counter * 100 if ground_move_counter % 10 < 5 else -ground_move_counter * 100
-                await send_move_packet(move_state, land_x + x_off, land_z, z_off,
-                                       target_addr=server_addr)
 
         while not local_closed:
             elapsed = time.time() - match_start_time
@@ -1400,25 +1398,54 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     last_activity = time.time()
                     frame = await decode_packet(response, udp_key_bytes, match_code)
                     if frame:
+                        cmd = frame['cmd']
                         ptype = await classify(frame)
 
-                        if frame['cmd'] in [103, 107]:
-                            log(f"[*] Match #{match_index} finished (cmd {frame['cmd']})")
+                        if cmd in [103, 107]:
+                            log(f"[*] Match #{match_index} finished (cmd {cmd})")
                             completed_cleanly = True
                             local_closed = True
                             continue
 
-                        if frame['cmd'] == 101:
+                        if cmd == 101 and join_info is None:
                             try:
-                                ack_pkt = await build_packet(
-                                    0x68, (await layouts_from_mask(match_code))[1],
-                                    0, 2, None, 1, b"\x01\x00", udp_key_bytes
-                                )
-                                await loop.sock_sendto(sock, ack_pkt, server_addr)
+                                vs = await read_varints_full(frame['content'])
+                                if len(vs) >= 3:
+                                    uid_v = vs[0]
+                                    pid_v = vs[2]
+                                    if uid_v and pid_v:
+                                        join_info = {'uid': uid_v, 'player_id': pid_v}
+                                        player_id = pid_v
                             except Exception:
                                 pass
 
-                        await handle_movement(frame, server_addr)
+                        if cmd == 1001:
+                            try:
+                                vs = await read_varints_full(frame['content'])
+                                if len(vs) >= 6 and vs[1] == 2 and 100000 < abs(vs[4]) < 3000000:
+                                    now = time.time()
+                                    plane.append({'t': now, 'x': vs[3], 'y': vs[4], 'z': vs[5]})
+                                    if len(plane) >= 5 and not jump_calculated:
+                                        from collections import Counter
+                                        y_clusters = Counter(round(p['y'] / 1000) for p in plane)
+                                        top_y, cnt = y_clusters.most_common(1)[0]
+                                        if cnt >= 3:
+                                            psel = [p for p in plane if round(p['y'] / 1000) == top_y]
+                                            p0, p1 = psel[0], psel[-1]
+                                            dt = p1['t'] - p0['t']
+                                            dist = ((p1['x'] - p0['x']) ** 2 + (p1['z'] - p0['z']) ** 2) ** 0.5
+                                            speed = dist / dt if dt > 0 else 0
+                                            if speed > 0:
+                                                dx = p1['x'] - p0['x']
+                                                dz = p1['z'] - p0['z']
+                                                direction = math.atan2(dz, dx)
+                                                land_x = p1['x'] + glide_distance * math.cos(direction + math.pi / 2)
+                                                land_z = p1['z'] + glide_distance * math.sin(direction + math.pi / 2)
+                                                time_to_jump = glide_distance / speed
+                                                jump_time_abs = time.time() + time_to_jump
+                                                jump_calculated = True
+                            except Exception:
+                                pass
 
                         if ptype in ["ACK", "PING", "HELLO", "JOIN_MATCH"]:
                             if ptype == "HELLO" and ack_state == "waiting_for_hello_reply":
@@ -1471,20 +1498,6 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                         completed_cleanly = True
                         break
 
-                if landed and land_time and time.time() - land_time > 0.3:
-                    land_time = time.time()
-                    ground_move_counter += 1
-                    if ground_move_counter % 5 == 0:   move_state, z_off = 40, 0
-                    elif ground_move_counter % 5 == 1: move_state, z_off = 104, 50
-                    elif ground_move_counter % 5 == 2: move_state, z_off = 132, 100
-                    elif ground_move_counter % 5 == 3: move_state, z_off = 136, 0
-                    else:                              move_state, z_off = 26, 0
-                    x_off = ground_move_counter * 100 if ground_move_counter % 10 < 5 else -ground_move_counter * 100
-                    try:
-                        await send_move_packet(move_state, land_x + x_off, land_z, z_off)
-                    except Exception:
-                        pass
-
             except BlockingIOError:
                 await asyncio.sleep(0.05)
             except OSError:
@@ -1505,6 +1518,16 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
 
     finally:
         ping_stop.set()
+        anti_stop.set()
+        if anti_task:
+            try:
+                await asyncio.wait_for(anti_task, timeout=2.0)
+            except Exception:
+                anti_task.cancel()
+                try:
+                    await anti_task
+                except Exception:
+                    pass
         if ping_task:
             ping_task.cancel()
             try:
@@ -1517,73 +1540,6 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
             except Exception:
                 pass
         await _dec_match(uid_str)
-
-
-def crc7_bytes(data: bytes) -> int:
-    c = 0
-    for b in data:
-        c = CRC7_TABLE[((2 * (c & 0xFF)) ^ (b & 0xFF)) & 0xFF] & 0x7F
-    return c & 0x7F
-
-
-def zigzag_encode(n):
-    z = n << 1
-    out = bytearray()
-    while z >= 0x80:
-        out.append((z & 0x7F) | 0x80)
-        z >>= 7
-    out.append(z)
-    return bytes(out)
-
-
-def build_movement_packet_2001(key_bytes, msg_key, player_state, x, y, z,
-                                tick, counter, move_state, account_uid,
-                                room_code, phase="game"):
-    if phase == "arena":
-        TAIL = (b"\x00" * 7 +
-                b"\xbd\xb6\xe1\xf3\x03" +
-                b"\x00" +
-                b"\xc4\xb6\xe1\xfb\x0b" +
-                b"\x00\x00")
-    elif phase == "game":
-        TAIL = (b"\x00" * 7 +
-                b"\x93\xca\xd5\xf9\x0b" +
-                b"\x8e\xfe\xfc\xf7\x0b" +
-                b"\xf4\xe0\xfe\xf7\x03" +
-                b"\x00\x00")
-    else:
-        TAIL = (b"\x00" * 7 +
-                b"\xbd\xb6\xe1\xf3\x03" +
-                b"\x00" +
-                b"\xc4\xb6\xe1\xfb\x0b" +
-                b"\x00\x00")
-
-    body = bytearray()
-    body += _pb_varint(account_uid)
-    body += _pb_varint(player_state)
-    body += zigzag_encode(x)
-    body += zigzag_encode(y)
-    body += zigzag_encode(z)
-    body += b"\x00"
-    body += _pb_varint(move_state)
-    body += TAIL
-    body += _pb_varint(tick)
-    body += b"\x00\x00\x00"
-    body += _pb_varint(counter)
-    body = bytes(body)
-
-    k = key_bytes[0]
-    v80 = ((k << 8) | k) & 0xFFFF
-
-    h = bytearray()
-    h.append(msg_key)
-    h.append(0x00)
-    h.append(0 ^ k)
-    h += ((1001 ^ v80) & 0xFFFF).to_bytes(2, "little")
-    h += (len(body) ^ v80).to_bytes(2, "little")
-    h.append(0 ^ k)
-    h[1] = crc7_bytes(bytes(h[2:]) + body)
-    return bytes(h) + body
 
 
 async def lw_fast_flow(addrs, tcp_online_starter, account_region, client_version,
@@ -1631,6 +1587,7 @@ async def lw_fast_flow(addrs, tcp_online_starter, account_region, client_version
             if raw_sock:
                 optimize_tcp_socket(raw_sock)
 
+            await asyncio.sleep(bypass_hello_delay())
             writer.write(bytes.fromhex(current_token))
             await writer.drain()
 
@@ -1645,7 +1602,7 @@ async def lw_fast_flow(addrs, tcp_online_starter, account_region, client_version
             async def func_gateway_keepalive():
                 ka_bytes = await send_keep_alive(account_region)
                 while True:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(bypass_ka_jitter(5.0))
                     try:
                         if writer and not writer.is_closing():
                             writer.write(ka_bytes)
@@ -1665,7 +1622,7 @@ async def lw_fast_flow(addrs, tcp_online_starter, account_region, client_version
                 nonlocal search_attempts, last_start_time
                 search_attempts += 1
                 try:
-                    await asyncio.sleep(random.uniform(0.3, 0.6))
+                    await asyncio.sleep(bypass_jitter(random.uniform(0.3, 0.6), 0.1))
                     log(f"[LW] UID {uid_str} -> LW match #{search_attempts}")
                     await start_game_lone_wolf(
                         account_region, client_version, writer,
@@ -1778,7 +1735,7 @@ async def lw_fast_flow(addrs, tcp_online_starter, account_region, client_version
                             )
                             play_matches.append(new_match)
 
-                            await asyncio.sleep(LW_NEW_MATCH_DELAY)
+                            await asyncio.sleep(bypass_jitter(LW_NEW_MATCH_DELAY, 1.0))
 
                             try:
                                 await refresh_account_profile(current_account_data)
@@ -1809,7 +1766,7 @@ async def lw_fast_flow(addrs, tcp_online_starter, account_region, client_version
                             parse_fail_count += 1
                             if parse_fail_count >= LW_MAX_PARSE_FAILS:
                                 parse_fail_count = 0
-                            await asyncio.sleep(LW_RECONNECT_DELAY)
+                            await asyncio.sleep(bypass_jitter(LW_RECONNECT_DELAY, 0.3))
                             break
 
                     except Exception as e:
@@ -1817,7 +1774,7 @@ async def lw_fast_flow(addrs, tcp_online_starter, account_region, client_version
                         parse_fail_count += 1
                         if parse_fail_count >= LW_MAX_PARSE_FAILS:
                             parse_fail_count = 0
-                        await asyncio.sleep(LW_RECONNECT_DELAY)
+                        await asyncio.sleep(bypass_jitter(LW_RECONNECT_DELAY, 0.3))
                         break
 
                 if 30 <= packet_length <= 40:
@@ -1842,7 +1799,7 @@ async def lw_fast_flow(addrs, tcp_online_starter, account_region, client_version
                 await asyncio.sleep(3)
                 continue
 
-            await asyncio.sleep(min(reconnects, 2))
+            await asyncio.sleep(bypass_human_reconnect_delay(reconnects))
         finally:
             if gateway_ping_task:
                 gateway_ping_task.cancel()
@@ -1918,6 +1875,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 if raw_sock:
                     optimize_tcp_socket(raw_sock)
 
+                await asyncio.sleep(bypass_hello_delay())
                 writer.write(bytes.fromhex(current_token))
                 await writer.drain()
 
@@ -1932,7 +1890,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 async def func_gateway_keepalive():
                     ka_bytes = await send_keep_alive(account_region)
                     while True:
-                        await asyncio.sleep(5)
+                        await asyncio.sleep(bypass_ka_jitter(5.0))
                         try:
                             if writer and not writer.is_closing():
                                 writer.write(ka_bytes)
@@ -1959,7 +1917,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                     except Exception:
                         pass
                     try:
-                        await asyncio.sleep(random.uniform(0.2, 0.4))
+                        await asyncio.sleep(bypass_jitter(random.uniform(0.2, 0.4), 0.1))
                         log(f"[BR] UID {uid_str} | Lvl {cur_lvl} -> BR match #{search_attempts}")
                         await start_game_battle_royale(
                             current_region, client_version, writer,
@@ -2156,7 +2114,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                     reconnects = 0
                     break
 
-                await asyncio.sleep(min(reconnects * 0.5, 2.0))
+                await asyncio.sleep(bypass_human_reconnect_delay(reconnects))
             finally:
                 if gateway_ping_task:
                     gateway_ping_task.cancel()
@@ -2204,7 +2162,7 @@ async def informational(addrs, starter_packet, key, iv, region="ME", account_id=
             async def info_keepalive():
                 ka_bytes = await send_keep_alive(region)
                 while True:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(bypass_ka_jitter(5.0))
                     try:
                         if writer and not writer.is_closing():
                             writer.write(ka_bytes)
@@ -2252,7 +2210,12 @@ async def refresh_account_profile(account_data: Dict):
         if not (url and token and release_version and payload):
             return
 
-        res = await send_getlogin(payload, url, token, release_version)
+        try:
+            res = await send_getlogin(payload, url, token, release_version)
+        except Exception as e:
+            log(f"[REFRESH] send_getlogin error: {e}")
+            return
+
         if not res:
             return
 
@@ -3058,6 +3021,149 @@ async def cb_refresh_profile(account_data: Dict):
         await refresh_account_profile(account_data)
     except Exception:
         pass
+
+
+async def _auto_cycle_one(auth_uid: str, auth_pass: str, target: int):
+    login_handler = bot_state.refresh_callbacks.get("on_account_login_only")
+    starter = bot_state.refresh_callbacks.get("on_start_account")
+    stopper = bot_state.refresh_callbacks.get("on_stop_account")
+    setter = bot_state.refresh_callbacks.get("on_set_target")
+    refresher = bot_state.refresh_callbacks.get("on_refresh_profile")
+
+    round_num = 0
+    real_uid = None
+
+    while True:
+        round_num += 1
+
+        try:
+            result = await login_handler({"type": "guest", "uid": auth_uid, "password": auth_pass})
+            if not result:
+                bot_state.log(f"[CYCLE] login returned empty for {auth_uid}")
+                await asyncio.sleep(bypass_jitter(15, 2))
+                continue
+            real_uid = str(result).strip()
+            if not real_uid:
+                bot_state.log(f"[CYCLE] login returned empty uid for {auth_uid}")
+                await asyncio.sleep(bypass_jitter(15, 2))
+                continue
+            bot_state.log(f"[CYCLE] login OK -> real_uid={real_uid}")
+        except Exception as e:
+            bot_state.log(f"[CYCLE] login fail {auth_uid}: {e}")
+            await asyncio.sleep(bypass_jitter(15, 2))
+            continue
+
+        if setter:
+            try:
+                await setter(real_uid, target)
+            except Exception:
+                pass
+
+        bot_state.auto_cycle_phase[real_uid] = "BR"
+        if starter:
+            try:
+                await starter(real_uid)
+            except Exception as e:
+                bot_state.log(f"[CYCLE] start fail {real_uid}: {e}")
+                await asyncio.sleep(bypass_jitter(10, 2))
+                continue
+
+        bot_state.log(f"[CYCLE] {real_uid} round {round_num} - BR phase")
+        await asyncio.sleep(bypass_jitter(BR_PHASE_SECONDS, 30))
+
+        if stopper:
+            try:
+                await stopper(real_uid)
+            except Exception:
+                pass
+
+        bot_state.auto_cycle_phase[real_uid] = "COOLDOWN"
+        bot_state.log(f"[CYCLE] {real_uid} cooldown")
+        await asyncio.sleep(bypass_jitter(COOLDOWN_SECONDS, 15))
+
+        try:
+            creds = bot_state.account_credentials.get(real_uid)
+            if creds and refresher:
+                await refresher(creds)
+        except Exception:
+            pass
+
+        try:
+            result = await login_handler({"type": "guest", "uid": auth_uid, "password": auth_pass})
+            if not result:
+                bot_state.log(f"[CYCLE] re-login empty for {auth_uid}")
+                await asyncio.sleep(bypass_jitter(15, 2))
+                continue
+            real_uid = str(result).strip()
+            if not real_uid:
+                bot_state.log(f"[CYCLE] re-login empty uid")
+                await asyncio.sleep(bypass_jitter(15, 2))
+                continue
+            bot_state.log(f"[CYCLE] re-login OK -> {real_uid}")
+        except Exception as e:
+            bot_state.log(f"[CYCLE] re-login fail: {e}")
+            await asyncio.sleep(bypass_jitter(15, 2))
+            continue
+
+        try:
+            creds = bot_state.account_credentials.get(real_uid)
+            if creds:
+                creds["force_lw"] = True
+                if not creds.get("level") or int(creds.get("level", 1)) < 3:
+                    creds["level"] = 3
+                if real_uid in bot_state.accounts:
+                    bot_state.accounts[real_uid]["level"] = 3
+        except Exception:
+            pass
+
+        if setter:
+            try:
+                await setter(real_uid, target)
+            except Exception:
+                pass
+
+        bot_state.auto_cycle_phase[real_uid] = "LW"
+        if starter:
+            try:
+                await starter(real_uid)
+            except Exception as e:
+                bot_state.log(f"[CYCLE] LW start fail {real_uid}: {e}")
+
+        bot_state.log(f"[CYCLE] {real_uid} round {round_num} - LW phase (continuous)")
+
+        while True:
+            await asyncio.sleep(30)
+
+            if real_uid in bot_state.exp_limit_reached_ref:
+                bot_state.log(f"[CYCLE] {real_uid} reached EXP target")
+                break
+
+            w = bot_state.account_workers.get(real_uid)
+            if not w or w.done():
+                bot_state.log(f"[CYCLE] {real_uid} worker stopped")
+                break
+
+            if asyncio.current_task().cancelled():
+                break
+
+        if real_uid in bot_state.exp_limit_reached_ref:
+            bot_state.log(f"[CYCLE] {real_uid} COMPLETED - stopping cycle")
+            if stopper:
+                try:
+                    await stopper(real_uid)
+                except Exception:
+                    pass
+            bot_state.auto_cycle_phase[real_uid] = "COMPLETED"
+            return
+
+        if stopper:
+            try:
+                await stopper(real_uid)
+            except Exception:
+                pass
+
+        bot_state.auto_cycle_phase[real_uid] = "RESTART"
+        await asyncio.sleep(bypass_jitter(5, 1))
 
 
 async def main():
